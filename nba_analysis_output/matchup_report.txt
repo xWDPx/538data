@@ -1,0 +1,27 @@
+Matchup Report: BOS vs GSW
+==================================================
+Predicted win probability — BOS: 36.1%
+Predicted win probability — GSW: 63.9%
+
+Key differentials (positive = favours team 1):
+  Net Rating  : -7.95
+  Offense     : -0.63
+  Defense     : -7.32 (negative = better defence for t1)
+  WAR         : +5.56
+
+(Team-specific player breakdown requires live nba_api data.)
+Showing league-wide top performers by WAR as a reference:
+
+Key players — BOS (sorted by PTS):
+  Nikola Jokic               25.7 PTS  3.5 AST  3.5 REB
+  Trae Young                 24.0 PTS  4.7 AST  5.5 REB
+  Payton Pritchard           23.5 PTS  4.2 AST  8.4 REB
+  Tyrese Haliburton          22.3 PTS  4.8 AST  5.2 REB
+  Marcus Smart               22.3 PTS  4.7 AST  3.2 REB
+
+Key players — GSW (sorted by PTS):
+  Shai Gilgeous-Alexander    21.0 PTS  5.3 AST  6.0 REB
+  Stephen Curry              21.0 PTS  6.3 AST  3.9 REB
+  Donovan Mitchell           20.9 PTS  3.3 AST  7.2 REB
+  Terence Davis              20.9 PTS  4.1 AST  3.8 REB
+  CJ McCollum                20.8 PTS  4.8 AST  3.3 REB
