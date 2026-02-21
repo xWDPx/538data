@@ -22,7 +22,7 @@ Usage:
   python nba_edge.py --team1 BOS --team2 GSW --neutral      (neutral site)
 """
 
-import os, sys, argparse, warnings
+import os, argparse, warnings
 import pandas as pd
 import numpy as np
 from scipy import stats
@@ -111,22 +111,64 @@ def expected_value(our_prob: float, posted_american: float, stake: float = 100) 
 
 # ── Team strength (current season) ───────────────────────────────────────────
 
-def load_team_ratings() -> pd.DataFrame:
-    """
-    Pull current-season team NET_RATING from nba_live helpers.
-    Falls back to RAPTOR-derived synthetic ratings.
-    """
-    # Try importing the loader from nba_live
-    sys.path.insert(0, BASE)
+CACHE_DIR  = os.path.join(OUT, "cache")
+SEASON     = "2024-25"
+
+def _nba_api_team_stats(force_refresh=False):
+    """Try nba_api leaguedashteamstats; cache result; return (df, 'live'/'cache')."""
+    import json, time
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(CACHE_DIR, "team_stats_current.json")
+
+    if not force_refresh and os.path.exists(cache_path):
+        with open(cache_path) as f:
+            data = json.load(f)
+        return pd.DataFrame(data["rows"], columns=data["columns"]), "cache"
+
     try:
-        from nba_live import load_team_stats
-        df, src = load_team_stats(force_refresh=False)
-    except Exception:
-        from nba_live import _build_synthetic_team_stats
-        df = _build_synthetic_team_stats()
+        from nba_api.stats.endpoints import leaguedashteamstats
+        obj = leaguedashteamstats.LeagueDashTeamStats(
+            season=SEASON,
+            season_type_all_star="Regular Season",
+            per_mode_simple="PerGame",
+            timeout=15,
+        )
+        time.sleep(0.6)
+        df = obj.get_data_frames()[0]
+        with open(cache_path, "w") as f:
+            json.dump({"columns": list(df.columns), "rows": df.values.tolist()}, f)
+        return df, "live"
+    except Exception as exc:
+        print(f"  [nba_api] unavailable ({type(exc).__name__}), using synthetic data")
+        return None, "synthetic"
+
+def _synthetic_team_stats():
+    """Derive current-season team ratings from 538 RAPTOR data (2022 season)."""
+    rt  = pd.read_csv(os.path.join(BASE, "nba-raptor", "modern_RAPTOR_by_team.csv"))
+    rs  = rt[(rt["season_type"] == "RS") & (rt["season"] == 2022)].copy()
+    agg = rs.groupby("team", as_index=False).agg(
+        raptor_off=("raptor_offense", "mean"),
+        raptor_def=("raptor_defense", "mean"),
+        raptor_tot=("raptor_total",   "mean"),
+        war=       ("war_reg_season", "sum"),
+    )
+    agg["TEAM_ABBREVIATION"] = agg["team"]
+    agg["OFF_RATING"] = 112 + agg["raptor_off"] * 1.8
+    agg["DEF_RATING"] = 112 - agg["raptor_def"] * 1.8
+    agg["NET_RATING"] = agg["OFF_RATING"] - agg["DEF_RATING"]
+    return agg
+
+def load_team_ratings(force_refresh=False) -> pd.DataFrame:
+    """
+    Load current-season team NET_RATING / OFF_RATING / DEF_RATING.
+    Priority: nba_api live → cached response → RAPTOR-derived synthetic.
+    No dependency on nba_live.py.
+    """
+    df, src = _nba_api_team_stats(force_refresh)
+    if df is None:
+        df  = _synthetic_team_stats()
         src = "synthetic"
 
-    # Normalise column names
     abbr_col = "TEAM_ABBREVIATION" if "TEAM_ABBREVIATION" in df.columns else "team"
     net_col  = "NET_RATING"        if "NET_RATING"        in df.columns else "raptor_tot"
     off_col  = "OFF_RATING"        if "OFF_RATING"        in df.columns else "raptor_off"
@@ -135,13 +177,7 @@ def load_team_ratings() -> pd.DataFrame:
 
     out = df[[abbr_col, net_col, off_col, def_col]].copy()
     out.columns = ["TEAM", "NET_RATING", "OFF_RATING", "DEF_RATING"]
-
-    if war_col in df.columns:
-        out["WAR"] = df[war_col].values
-    else:
-        out["WAR"] = 0.0
-
-    # Append ATS historical tendency
+    out["WAR"]      = df[war_col].values if war_col in df.columns else 0.0
     out["ATS_BIAS"] = out["TEAM"].map(ATS_HISTORY).fillna(0.0)
 
     print(f"  Team ratings loaded [{src}]")
