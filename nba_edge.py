@@ -114,8 +114,17 @@ def expected_value(our_prob: float, posted_american: float, stake: float = 100) 
 CACHE_DIR  = os.path.join(OUT, "cache")
 SEASON     = "2024-25"
 
+_NBA_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.nba.com/",
+}
+
 def _nba_api_team_stats(force_refresh=False):
-    """Try nba_api leaguedashteamstats; cache result; return (df, 'live'/'cache')."""
+    """Try nba_api leaguedashteamstats; cache result; return (df, src)."""
     import json, time
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_path = os.path.join(CACHE_DIR, "team_stats_current.json")
@@ -125,22 +134,38 @@ def _nba_api_team_stats(force_refresh=False):
             data = json.load(f)
         return pd.DataFrame(data["rows"], columns=data["columns"]), "cache"
 
-    try:
-        from nba_api.stats.endpoints import leaguedashteamstats
-        obj = leaguedashteamstats.LeagueDashTeamStats(
-            season=SEASON,
-            season_type_all_star="Regular Season",
-            per_mode_simple="PerGame",
-            timeout=15,
-        )
-        time.sleep(0.6)
-        df = obj.get_data_frames()[0]
-        with open(cache_path, "w") as f:
-            json.dump({"columns": list(df.columns), "rows": df.values.tolist()}, f)
-        return df, "live"
-    except Exception as exc:
-        print(f"  [nba_api] unavailable ({type(exc).__name__}), using synthetic data")
-        return None, "synthetic"
+    last_exc = None
+    for attempt in range(3):
+        try:
+            from nba_api.stats.endpoints import leaguedashteamstats
+            obj = leaguedashteamstats.LeagueDashTeamStats(
+                season=SEASON,
+                season_type_all_star="Regular Season",
+                per_mode_simple="PerGame",
+                timeout=60,
+                headers=_NBA_HEADERS,
+            )
+            time.sleep(0.6)
+            df = obj.get_data_frames()[0]
+            with open(cache_path, "w") as f:
+                json.dump({"columns": list(df.columns), "rows": df.values.tolist()}, f)
+            return df, "live"
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                wait = 2 ** attempt
+                print(f"  [nba_api] attempt {attempt + 1} failed ({type(exc).__name__}), retrying in {wait}s...")
+                time.sleep(wait)
+
+    # All retries failed — fall back to stale cache if it exists
+    if os.path.exists(cache_path):
+        print(f"  [nba_api] unavailable ({type(last_exc).__name__}), using stale cache")
+        with open(cache_path) as f:
+            data = json.load(f)
+        return pd.DataFrame(data["rows"], columns=data["columns"]), "stale-cache"
+
+    print(f"  [nba_api] unavailable ({type(last_exc).__name__}), using synthetic data")
+    return None, "synthetic"
 
 def _synthetic_team_stats():
     """Derive current-season team ratings from 538 RAPTOR data (2022 season)."""
