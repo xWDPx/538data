@@ -1,0 +1,37 @@
+NBA Game Outcome Prediction — Logistic Regression (ELO differential)
+======================================================================
+
+Training samples : 2,104
+Test samples     : 526
+Test accuracy    : 64.26%
+
+Classification Report:
+              precision    recall  f1-score   support
+
+        Loss       0.63      0.49      0.55       235
+         Win       0.65      0.77      0.70       291
+
+    accuracy                           0.64       526
+   macro avg       0.64      0.63      0.63       526
+weighted avg       0.64      0.64      0.64       526
+
+
+Model coefficients (standardised ELO diff):
+  coef      = 0.9255
+  intercept = 0.3992
+
+Quick prediction function:
+  from sklearn.linear_model import LogisticRegression
+  # win_prob = logistic(coef * (elo_diff - mean) / std + intercept)
+
+Top 10 players by career WAR (2014–2022):
+  James Harden               WAR=122.3  OFF=+7.18  DEF=+0.02
+  Stephen Curry              WAR=118.8  OFF=+8.11  DEF=+0.21
+  Chris Paul                 WAR=99.8  OFF=+6.28  DEF=+0.88
+  LeBron James               WAR=95.3  OFF=+5.96  DEF=+0.33
+  Nikola Jokic               WAR=91.4  OFF=+6.14  DEF=+2.23
+  Damian Lillard             WAR=83.3  OFF=+5.74  DEF=-1.54
+  Jimmy Butler               WAR=82.4  OFF=+3.67  DEF=+1.79
+  Kawhi Leonard              WAR=81.6  OFF=+4.60  DEF=+3.42
+  Kyle Lowry                 WAR=79.9  OFF=+3.86  DEF=+0.66
+  Paul George                WAR=79.3  OFF=+2.88  DEF=+2.88
