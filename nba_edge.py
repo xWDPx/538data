@@ -42,12 +42,14 @@ os.makedirs(OUT, exist_ok=True)
 TITLE_KW = dict(fontsize=13, fontweight="bold", pad=10)
 
 # ── Model constants (calibrated on 538 ELO data 2010-2015) ───────────────────
-SPREAD_SIGMA = 11.95   # residual std dev in points
-HCA_PTS      = 3.0     # home court advantage in points (rounded from regression)
+SPREAD_SIGMA    = 11.95   # residual std dev in points
+HCA_PTS         = 3.0     # home court advantage in points (rounded from regression)
 # NET_RATING is pts per 100 poss; scale to a per-game prediction
 # (league avg ~100 poss/game → NET_RATING ≈ expected pt diff per game)
 # ELO calibration: 1 NET_RATING pt ≈ 28.5 ELO pts (from 0.035 pts/ELO)
 NET_RATING_TO_ELO = 28.5
+LEAGUE_AVG_PTS  = 113.5   # avg pts scored per team per game (2024-25 season)
+TOTAL_SIGMA     = 12.0    # std dev of game totals in points
 
 # ── ATS history (pre-computed from 538 data, 2010–2015) ──────────────────────
 # mean outperformance vs ELO-predicted spread (positive = beats the spread more)
@@ -249,6 +251,16 @@ def predict(team1: str, team2: str, home: str | None,
     ci_lo = predicted_margin_ats + stats.norm.ppf(0.05) * SPREAD_SIGMA
     ci_hi = predicted_margin_ats + stats.norm.ppf(0.95) * SPREAD_SIGMA
 
+    # ── Total points prediction ───────────────────────────────────────────────
+    # Predicted score for each team = league avg + own OFF edge – opp DEF edge
+    #   t1_pts = LEAGUE_AVG + (r1.OFF - LEAGUE_AVG) - (r2.DEF - LEAGUE_AVG)
+    #          = LEAGUE_AVG + r1.OFF - r2.DEF
+    t1_pts = LEAGUE_AVG_PTS + float(r1["OFF_RATING"]) - float(r2["DEF_RATING"])
+    t2_pts = LEAGUE_AVG_PTS + float(r2["OFF_RATING"]) - float(r1["DEF_RATING"])
+    predicted_total = t1_pts + t2_pts
+    total_ci_lo = predicted_total + stats.norm.ppf(0.05) * TOTAL_SIGMA
+    total_ci_hi = predicted_total + stats.norm.ppf(0.95) * TOTAL_SIGMA
+
     return {
         "team1": team1, "team2": team2, "home": home,
         "net_diff": net_diff,
@@ -261,6 +273,11 @@ def predict(team1: str, team2: str, home: str | None,
         "ci_lo": ci_lo, "ci_hi": ci_hi,
         "fair_spread": -predicted_margin_ats,   # from team1's perspective as favourite
         "fair_american": prob_to_american(win_prob_ats),
+        "predicted_total": predicted_total,
+        "predicted_t1_pts": t1_pts,
+        "predicted_t2_pts": t2_pts,
+        "total_ci_lo": total_ci_lo,
+        "total_ci_hi": total_ci_hi,
         "r1": r1, "r2": r2,
     }
 
@@ -268,7 +285,9 @@ def predict(team1: str, team2: str, home: str | None,
 # ── Edge evaluation (vs a posted line) ───────────────────────────────────────
 
 def evaluate_line(pred: dict, posted_spread: float | None,
-                  posted_american: float | None) -> dict:
+                  posted_american: float | None,
+                  posted_total: float | None = None,
+                  posted_total_odds: float | None = None) -> dict:
     result = {}
 
     if posted_spread is not None:
@@ -287,7 +306,6 @@ def evaluate_line(pred: dict, posted_spread: float | None,
         result["market_implied_prob"] = market_prob
         result["edge_pct"] = edge_pct
         result["ev_per_100"] = ev
-        # Verdict tiers
         if edge_pct >= 0.05:
             result["verdict"] = "STRONG EDGE"
         elif edge_pct >= 0.03:
@@ -297,6 +315,20 @@ def evaluate_line(pred: dict, posted_spread: float | None,
         else:
             result["verdict"] = "PASS"
         result["attractive"] = edge_pct >= 0.02
+
+    if posted_total is not None:
+        mu = pred["predicted_total"]
+        over_prob  = 1 - stats.norm.cdf(posted_total, loc=mu, scale=TOTAL_SIGMA)
+        under_prob = 1 - over_prob
+        total_edge = mu - posted_total          # positive → model likes the over
+        result["posted_total"]  = posted_total
+        result["over_prob"]     = over_prob
+        result["under_prob"]    = under_prob
+        result["total_edge_pts"] = total_edge
+        if posted_total_odds is not None:
+            result["posted_total_odds"] = posted_total_odds
+            result["over_ev"]  = expected_value(over_prob,  posted_total_odds)
+            result["under_ev"] = expected_value(under_prob, posted_total_odds)
 
     return result
 
@@ -516,6 +548,13 @@ def print_report(pred: dict, line_eval: dict):
     print(f"  {'Moneyline':30s} {t1}: {pred['fair_american']}  |  "
           f"{t2}: {prob_to_american(1-pred['win_prob_ats'])}")
 
+    print(f"\n  TOTAL POINTS")
+    print(f"  {'Predicted ' + t1 + ' score':30s} {pred['predicted_t1_pts']:.1f}")
+    print(f"  {'Predicted ' + t2 + ' score':30s} {pred['predicted_t2_pts']:.1f}")
+    print(f"  {'─'*40}")
+    print(f"  {'Predicted total':30s} {pred['predicted_total']:.1f} pts")
+    print(f"  {'90% CI':30s} [{pred['total_ci_lo']:.1f},  {pred['total_ci_hi']:.1f}]")
+
     if line_eval:
         print(f"\n  LINE EVALUATION")
         if "posted_spread" in line_eval:
@@ -538,8 +577,24 @@ def print_report(pred: dict, line_eval: dict):
             v = line_eval.get("verdict", "PASS")
             icon = "✓" if line_eval.get("attractive") else "✗"
             print(f"\n  {'Verdict':30s} {icon} {v}")
+        if "posted_total" in line_eval:
+            pt  = line_eval['posted_total']
+            op  = line_eval['over_prob']
+            up  = line_eval['under_prob']
+            te  = line_eval['total_edge_pts']
+            print(f"\n  TOTAL LINE EVALUATION")
+            print(f"  {'Posted total (O/U)':30s} {pt:.1f}")
+            print(f"  {'Model total':30s} {pred['predicted_total']:.1f}")
+            print(f"  {'Total edge':30s} {te:+.1f} pts  ({'over' if te > 0 else 'under'} lean)")
+            print(f"  {'Over probability':30s} {op:.1%}")
+            print(f"  {'Under probability':30s} {up:.1%}")
+            if "over_ev" in line_eval:
+                odds = line_eval['posted_total_odds']
+                print(f"  {'Posted total odds':30s} {odds:+.0f}")
+                print(f"  {'EV on over per $100':30s} ${line_eval['over_ev']:+.2f}")
+                print(f"  {'EV on under per $100':30s} ${line_eval['under_ev']:+.2f}")
     else:
-        print(f"\n  Tip: add --spread -4.5 --moneyline -190 to evaluate a specific line.")
+        print(f"\n  Tip: add --spread -4.5 --moneyline -190 --total 224.5 to evaluate lines.")
 
     print(f"\n{sep}\n")
 
@@ -552,10 +607,14 @@ def main():
     parser.add_argument("--team2",     required=True,  help="Team 2 abbreviation (the opponent)")
     parser.add_argument("--home",      default=None,   help="Which team is home (default: team1)")
     parser.add_argument("--neutral",   action="store_true", help="Neutral site (no HCA)")
-    parser.add_argument("--spread",    type=float, default=None,
+    parser.add_argument("--spread",      type=float, default=None,
                         help="Posted spread for team1 (e.g. -4.5 or +2.0)")
-    parser.add_argument("--moneyline", type=float, default=None,
+    parser.add_argument("--moneyline",  type=float, default=None,
                         help="Posted American moneyline for team1 (e.g. -190 or +155)")
+    parser.add_argument("--total",      type=float, default=None,
+                        help="Posted over/under total (e.g. 224.5)")
+    parser.add_argument("--total-odds", type=float, default=None,
+                        help="American odds for the over (e.g. -110)")
     parser.add_argument("--all-teams", action="store_true",
                         help="Show ATS overview for all 30 teams and exit")
     args = parser.parse_args()
@@ -579,8 +638,9 @@ def main():
     pred = predict(t1, t2, home, ratings)
 
     line_eval = {}
-    if args.spread is not None or args.moneyline is not None:
-        line_eval = evaluate_line(pred, args.spread, args.moneyline)
+    if args.spread is not None or args.moneyline is not None or args.total is not None:
+        line_eval = evaluate_line(pred, args.spread, args.moneyline,
+                                  args.total, args.total_odds)
 
     print("Generating charts...")
     plot_calibration()
