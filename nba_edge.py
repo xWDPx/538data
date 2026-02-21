@@ -12,13 +12,17 @@ Model calibration (from 538 ELO data, 2010–2015, ~9 000 games):
   predicted_margin = 0.035 * elo_diff + 1.807 * is_home + 1.042
   residual σ ≈ 12 points  →  win_prob = Φ(predicted_margin / σ)
 
-Current team strength sourced from nba_live.py (nba_api or RAPTOR fallback).
+Current team strength sourced from two APIs (best available wins):
+  1. nba_api  — official pts-per-100-poss efficiency ratings (primary)
+  2. BallDontLie — pts-per-game season averages (fallback + recent form)
+     Set BALLDONTLIE_API_KEY env var to enable BDL.  Free tier sufficient.
 
 Usage:
   python nba_edge.py --team1 BOS --team2 GSW
   python nba_edge.py --team1 BOS --team2 GSW --home BOS
   python nba_edge.py --team1 BOS --team2 GSW --spread -4.5
   python nba_edge.py --team1 BOS --team2 GSW --spread -4.5 --moneyline -190
+  python nba_edge.py --team1 BOS --team2 GSW --total 224.5 --total-odds -110
   python nba_edge.py --team1 BOS --team2 GSW --neutral      (neutral site)
 """
 
@@ -113,8 +117,10 @@ def expected_value(our_prob: float, posted_american: float, stake: float = 100) 
 
 # ── Team strength (current season) ───────────────────────────────────────────
 
-CACHE_DIR  = os.path.join(OUT, "cache")
-SEASON     = "2024-25"
+CACHE_DIR   = os.path.join(OUT, "cache")
+SEASON      = "2024-25"
+BDL_SEASON  = 2024          # balldontlie.io season code for 2024-25
+BDL_BASE    = "https://api.balldontlie.io/nba/v1"
 
 _NBA_HEADERS = {
     "User-Agent": (
@@ -169,6 +175,111 @@ def _nba_api_team_stats(force_refresh=False):
     print(f"  [nba_api] unavailable ({type(last_exc).__name__}), using synthetic data")
     return None, "synthetic"
 
+
+# ── BallDontLie helpers ───────────────────────────────────────────────────────
+
+def _balldontlie_fetch_games(force_refresh=False):
+    """
+    Fetch all finished 2024-25 games from balldontlie.io.
+    Requires BALLDONTLIE_API_KEY env var.
+    Returns (list[game_dict], source_str).  Caches raw data for 12 h.
+    """
+    import json, time, urllib.request
+
+    api_key = os.environ.get("BALLDONTLIE_API_KEY", "").strip()
+    if not api_key:
+        return None, "no-bdl-key"
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(CACHE_DIR, "bdl_games.json")
+
+    if not force_refresh and os.path.exists(cache_path):
+        age_h = (time.time() - os.path.getmtime(cache_path)) / 3600
+        if age_h < 12:
+            with open(cache_path) as f:
+                return json.load(f), "bdl-cache"
+
+    headers = {"Authorization": api_key, "Accept": "application/json"}
+
+    def _get(url):
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+
+    games, cursor = [], None
+    try:
+        for _ in range(80):                     # safety cap (80 × 100 = 8 000 games)
+            url = f"{BDL_BASE}/games?seasons[]={BDL_SEASON}&per_page=100"
+            if cursor:
+                url += f"&cursor={cursor}"
+            resp    = _get(url)
+            games.extend(resp["data"])
+            cursor  = resp.get("meta", {}).get("next_cursor")
+            if not cursor:
+                break
+            time.sleep(0.4)                     # stay within free-tier rate limit
+    except Exception as exc:
+        print(f"  [balldontlie] fetch failed ({type(exc).__name__}: {exc})")
+        if os.path.exists(cache_path):
+            with open(cache_path) as f:
+                return json.load(f), "bdl-stale-cache"
+        return None, "bdl-unavailable"
+
+    finished = [
+        g for g in games
+        if str(g.get("status", "")).lower() == "final"
+        and g.get("home_team_score") and g.get("visitor_team_score")
+    ]
+    with open(cache_path, "w") as f:
+        json.dump(finished, f)
+    print(f"  [balldontlie] {len(finished)} finished games fetched")
+    return finished, "bdl-live"
+
+
+def _bdl_aggregate(games, n_recent=None):
+    """
+    Aggregate game list into per-team pts-per-game OFF / DEF / NET ratings.
+    n_recent: if set, use only the most-recent N games per team (sorted by date).
+    Returns DataFrame indexed by TEAM abbreviation, or empty DataFrame.
+    """
+    from collections import defaultdict
+    # Sort newest-first so slicing gives most-recent games easily
+    sorted_g = sorted(games, key=lambda g: g.get("date", ""), reverse=True)
+
+    pts_for, pts_against = defaultdict(list), defaultdict(list)
+    for g in sorted_g:
+        h    = g["home_team"]["abbreviation"]
+        v    = g["visitor_team"]["abbreviation"]
+        hs   = g["home_team_score"]
+        vs   = g["visitor_team_score"]
+        for abbr, scored, allowed in [(h, hs, vs), (v, vs, hs)]:
+            if n_recent is None or len(pts_for[abbr]) < n_recent:
+                pts_for[abbr].append(scored)
+                pts_against[abbr].append(allowed)
+
+    rows = []
+    for team in sorted(pts_for):
+        n   = len(pts_for[team])
+        off = sum(pts_for[team]) / n
+        dff = sum(pts_against[team]) / n
+        rows.append({"TEAM": team, "OFF_RATING": off,
+                     "DEF_RATING": dff, "NET_RATING": off - dff, "GP": n})
+    return pd.DataFrame(rows).set_index("TEAM") if rows else pd.DataFrame()
+
+
+def _balldontlie_team_stats(force_refresh=False):
+    """
+    Returns (season_df, recent_df, source_str).
+    season_df : full-season per-game averages per team
+    recent_df : last-10-game averages per team  (for form delta)
+    Either df may be None / empty if data is unavailable.
+    """
+    games, src = _balldontlie_fetch_games(force_refresh)
+    if games is None:
+        return None, None, src
+    return _bdl_aggregate(games), _bdl_aggregate(games, n_recent=10), src
+
+
 def _synthetic_team_stats():
     """Derive current-season team ratings from 538 RAPTOR data (2022 season)."""
     rt  = pd.read_csv(os.path.join(BASE, "nba-raptor", "modern_RAPTOR_by_team.csv"))
@@ -188,27 +299,64 @@ def _synthetic_team_stats():
 def load_team_ratings(force_refresh=False) -> pd.DataFrame:
     """
     Load current-season team NET_RATING / OFF_RATING / DEF_RATING.
-    Priority: nba_api live → cached response → RAPTOR-derived synthetic.
-    No dependency on nba_live.py.
+
+    Data priority:
+      1. nba_api  — true pts-per-100-poss efficiency ratings (best)
+      2. BallDontLie — pts-per-game season averages (fallback when nba_api fails)
+      3. Stale nba_api cache
+      4. RAPTOR-derived synthetic (last resort)
+
+    When BallDontLie data is available (API key set), FORM_DELTA is always
+    added to the ratings: recent-10-game NET − full-season NET (pts/game).
+    Positive FORM_DELTA = team is on a hot streak; negative = cold streak.
     """
-    df, src = _nba_api_team_stats(force_refresh)
-    if df is None:
-        df  = _synthetic_team_stats()
+    nba_df, nba_src                    = _nba_api_team_stats(force_refresh)
+    bdl_season, bdl_recent, bdl_src    = _balldontlie_team_stats(force_refresh)
+
+    # ── Build base ratings from the best available source ────────────────────
+    if nba_df is not None:
+        abbr_col = "TEAM_ABBREVIATION" if "TEAM_ABBREVIATION" in nba_df.columns else "team"
+        net_col  = "NET_RATING"        if "NET_RATING"        in nba_df.columns else "raptor_tot"
+        off_col  = "OFF_RATING"        if "OFF_RATING"        in nba_df.columns else "raptor_off"
+        def_col  = "DEF_RATING"        if "DEF_RATING"        in nba_df.columns else "raptor_def"
+        war_col  = "war"               if "war"               in nba_df.columns else "war_reg_season"
+        out = nba_df[[abbr_col, net_col, off_col, def_col]].copy()
+        out.columns = ["TEAM", "NET_RATING", "OFF_RATING", "DEF_RATING"]
+        out["WAR"] = nba_df[war_col].values if war_col in nba_df.columns else 0.0
+        out = out.set_index("TEAM")
+        src = nba_src
+
+    elif bdl_season is not None and not bdl_season.empty:
+        # BDL pts/game is the same scale as pts/100-poss at avg pace (~100 poss/game)
+        out = bdl_season[["OFF_RATING", "DEF_RATING", "NET_RATING"]].copy()
+        out["WAR"] = 0.0
+        src = f"{bdl_src} (pts/game proxy — nba_api unavailable)"
+
+    else:
+        synth = _synthetic_team_stats()
+        out   = synth[["TEAM_ABBREVIATION", "NET_RATING", "OFF_RATING", "DEF_RATING"]].copy()
+        out.columns = ["TEAM", "NET_RATING", "OFF_RATING", "DEF_RATING"]
+        out["WAR"] = synth["war"].values if "war" in synth.columns else 0.0
+        out = out.set_index("TEAM")
         src = "synthetic"
 
-    abbr_col = "TEAM_ABBREVIATION" if "TEAM_ABBREVIATION" in df.columns else "team"
-    net_col  = "NET_RATING"        if "NET_RATING"        in df.columns else "raptor_tot"
-    off_col  = "OFF_RATING"        if "OFF_RATING"        in df.columns else "raptor_off"
-    def_col  = "DEF_RATING"        if "DEF_RATING"        in df.columns else "raptor_def"
-    war_col  = "war"               if "war"               in df.columns else "war_reg_season"
+    out["ATS_BIAS"] = out.index.map(ATS_HISTORY).fillna(0.0)
 
-    out = df[[abbr_col, net_col, off_col, def_col]].copy()
-    out.columns = ["TEAM", "NET_RATING", "OFF_RATING", "DEF_RATING"]
-    out["WAR"]      = df[war_col].values if war_col in df.columns else 0.0
-    out["ATS_BIAS"] = out["TEAM"].map(ATS_HISTORY).fillna(0.0)
+    # ── Add BDL recent-form delta (last 10 games vs full season) ─────────────
+    out["FORM_DELTA"] = 0.0
+    if (bdl_recent is not None and not bdl_recent.empty
+            and bdl_season is not None and not bdl_season.empty):
+        common = out.index.intersection(bdl_recent.index).intersection(bdl_season.index)
+        out.loc[common, "FORM_DELTA"] = (
+            bdl_recent.loc[common, "NET_RATING"]
+            - bdl_season.loc[common, "NET_RATING"]
+        )
 
-    print(f"  Team ratings loaded [{src}]")
-    return out.set_index("TEAM")
+    sources = [src]
+    if bdl_recent is not None and not bdl_recent.empty:
+        sources.append(f"{bdl_src} (form)")
+    print(f"  Team ratings loaded [{' | '.join(sources)}]")
+    return out
 
 
 # ── Core prediction ───────────────────────────────────────────────────────────
@@ -231,6 +379,9 @@ def predict(team1: str, team2: str, home: str | None,
                          f"Available: {sorted(team_ratings.index.tolist())}")
 
     r1, r2 = get(team1), get(team2)
+
+    form1 = float(r1.get("FORM_DELTA", 0))
+    form2 = float(r2.get("FORM_DELTA", 0))
 
     is_home_1 = 1 if home == team1 else (-1 if home == team2 else 0)
     hca_margin = HCA_PTS * is_home_1   # positive if team1 is home
@@ -278,6 +429,7 @@ def predict(team1: str, team2: str, home: str | None,
         "predicted_t2_pts": t2_pts,
         "total_ci_lo": total_ci_lo,
         "total_ci_hi": total_ci_hi,
+        "form1": form1, "form2": form2,
         "r1": r1, "r2": r2,
     }
 
@@ -547,6 +699,14 @@ def print_report(pred: dict, line_eval: dict):
           f"{t2}: {1-pred['win_prob_ats']:.1%}")
     print(f"  {'Moneyline':30s} {t1}: {pred['fair_american']}  |  "
           f"{t2}: {prob_to_american(1-pred['win_prob_ats'])}")
+
+    if pred["form1"] != 0 or pred["form2"] != 0:
+        def _form_tag(d):
+            if abs(d) < 0.5:  return "~flat"
+            return ("▲ hot" if d > 0 else "▼ cold") + f" ({d:+.1f} pts/g, last 10)"
+        print(f"\n  RECENT FORM  (last-10 vs season, via BallDontLie)")
+        print(f"  {t1:30s} {_form_tag(pred['form1'])}")
+        print(f"  {t2:30s} {_form_tag(pred['form2'])}")
 
     print(f"\n  TOTAL POINTS")
     print(f"  {'Predicted ' + t1 + ' score':30s} {pred['predicted_t1_pts']:.1f}")
