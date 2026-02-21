@@ -27,6 +27,17 @@ Usage:
 """
 
 import os, argparse, warnings
+
+# Load .env from project root (if present) so BALLDONTLIE_API_KEY etc. are set
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 import pandas as pd
 import numpy as np
 from scipy import stats
