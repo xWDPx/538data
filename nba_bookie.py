@@ -240,7 +240,7 @@ def fetch_todays_games(target_date: Optional[str] = None) -> List[Dict[str, str]
     if bdl_api_key:
         try:
             d = target_date or datetime.now().strftime("%Y-%m-%d")
-            url = f"https://api.balldontlie.io/v1/games?dates[]={d}"
+            url = f"https://api.balldontlie.io/nba/v1/games?dates[]={d}"
             headers = {"Authorization": bdl_api_key}
             resp = requests.get(url, headers=headers, timeout=15)
             if resp.status_code == 200:
