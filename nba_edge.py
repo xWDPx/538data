@@ -28,8 +28,8 @@ Usage:
 
 import os, argparse, warnings
 
-# Load .env from project root (if present) so BALLDONTLIE_API_KEY etc. are set
-_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+# Load .env from shared secrets location so BALLDONTLIE_API_KEY etc. are set
+_env_path = "/tmp/538data/.env"
 if os.path.exists(_env_path):
     with open(_env_path) as _f:
         for _line in _f:
