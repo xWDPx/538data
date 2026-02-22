@@ -17,8 +17,14 @@ Current team strength sourced from two APIs (best available wins):
   2. BallDontLie — pts-per-game season averages (fallback + recent form)
      Set BALLDONTLIE_API_KEY env var to enable BDL.  Free tier sufficient.
 
+Live lines sourced automatically when ODDS_API_KEY env var is set:
+  3. The Odds API — consensus spread, moneyline, and total across DraftKings,
+     FanDuel, BetMGM, and Caesars.  If a key is present and no manual lines
+     are supplied, lines are fetched and evaluated automatically.
+     See https://the-odds-api.com for a free API key.
+
 Usage:
-  python nba_edge.py --team1 BOS --team2 GSW
+  python nba_edge.py --team1 BOS --team2 GSW          (auto-fetches lines)
   python nba_edge.py --team1 BOS --team2 GSW --home BOS
   python nba_edge.py --team1 BOS --team2 GSW --spread -4.5
   python nba_edge.py --team1 BOS --team2 GSW --spread -4.5 --moneyline -190
@@ -132,6 +138,27 @@ CACHE_DIR   = os.path.join(OUT, "cache")
 SEASON      = "2024-25"
 BDL_SEASON  = 2024          # balldontlie.io season code for 2024-25
 BDL_BASE    = "https://api.balldontlie.io/nba/v1"
+ODDS_BASE   = "https://api.the-odds-api.com/v4"
+
+# Full team names used by The Odds API → map from/to abbreviations
+_TEAM_NAMES = {
+    "ATL": "Atlanta Hawks",           "BOS": "Boston Celtics",
+    "BKN": "Brooklyn Nets",           "CHA": "Charlotte Hornets",
+    "CHI": "Chicago Bulls",           "CLE": "Cleveland Cavaliers",
+    "DAL": "Dallas Mavericks",        "DEN": "Denver Nuggets",
+    "DET": "Detroit Pistons",         "GSW": "Golden State Warriors",
+    "HOU": "Houston Rockets",         "IND": "Indiana Pacers",
+    "LAC": "LA Clippers",             "LAL": "Los Angeles Lakers",
+    "MEM": "Memphis Grizzlies",       "MIA": "Miami Heat",
+    "MIL": "Milwaukee Bucks",         "MIN": "Minnesota Timberwolves",
+    "NOP": "New Orleans Pelicans",    "NYK": "New York Knicks",
+    "OKC": "Oklahoma City Thunder",   "ORL": "Orlando Magic",
+    "PHI": "Philadelphia 76ers",      "PHO": "Phoenix Suns",
+    "POR": "Portland Trail Blazers",  "SAC": "Sacramento Kings",
+    "SAS": "San Antonio Spurs",       "TOR": "Toronto Raptors",
+    "UTA": "Utah Jazz",               "WAS": "Washington Wizards",
+}
+_NAME_TO_ABBR = {v.lower(): k for k, v in _TEAM_NAMES.items()}
 
 _NBA_HEADERS = {
     "User-Agent": (
@@ -289,6 +316,106 @@ def _balldontlie_team_stats(force_refresh=False):
     if games is None:
         return None, None, src
     return _bdl_aggregate(games), _bdl_aggregate(games, n_recent=10), src
+
+
+# ── The Odds API (live lines) ─────────────────────────────────────────────────
+
+def _fetch_live_odds(team1: str, team2: str):
+    """
+    Fetch live consensus spread, moneyline, and total for team1 vs team2.
+    Requires ODDS_API_KEY env var.  Caches result for 15 minutes.
+    Returns dict with keys: spread, moneyline, total, total_odds, home.
+    Returns None if key missing, game not found, or fetch fails.
+    """
+    import json, time, urllib.request, urllib.parse
+
+    api_key = os.environ.get("ODDS_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    name1 = _TEAM_NAMES.get(team1, "").lower()
+    name2 = _TEAM_NAMES.get(team2, "").lower()
+    if not name1 or not name2:
+        print(f"  [odds-api] unknown abbreviation: {team1} or {team2}")
+        return None
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_file = os.path.join(CACHE_DIR, f"odds_{team1}_{team2}.json")
+    if os.path.exists(cache_file):
+        if (time.time() - os.path.getmtime(cache_file)) / 60 < 15:
+            with open(cache_file) as f:
+                cached = json.load(f)
+            print(f"  [odds-api] using cached lines (<15 min old)")
+            return cached
+
+    params = urllib.parse.urlencode({
+        "apiKey": api_key,
+        "regions": "us",
+        "markets": "h2h,spreads,totals",
+        "oddsFormat": "american",
+        "bookmakers": "draftkings,fanduel,betmgm,caesars",
+    })
+    url = f"{ODDS_BASE}/sports/basketball_nba/odds/?{params}"
+
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            games = json.loads(resp.read())
+    except Exception as exc:
+        print(f"  [odds-api] fetch failed ({type(exc).__name__}: {exc})")
+        return None
+
+    # Find the game (either home/away order)
+    match = None
+    for g in games:
+        ht = g.get("home_team", "").lower()
+        at = g.get("away_team", "").lower()
+        if {ht, at} == {name1, name2}:
+            match = g
+            break
+
+    if match is None:
+        print(f"  [odds-api] no upcoming game found for {team1} vs {team2}")
+        return None
+
+    home_abbr = _NAME_TO_ABBR.get(match["home_team"].lower(), team1)
+
+    # Average lines across available bookmakers
+    spreads, h2hs, totals, total_odds_list = [], [], [], []
+    bk_names = []
+    for bk in match.get("bookmakers", []):
+        bk_names.append(bk.get("title", ""))
+        for mkt in bk.get("markets", []):
+            if mkt["key"] == "spreads":
+                for oc in mkt["outcomes"]:
+                    if _NAME_TO_ABBR.get(oc["name"].lower()) == team1:
+                        spreads.append(oc["point"])
+            elif mkt["key"] == "h2h":
+                for oc in mkt["outcomes"]:
+                    if _NAME_TO_ABBR.get(oc["name"].lower()) == team1:
+                        h2hs.append(oc["price"])
+            elif mkt["key"] == "totals":
+                for oc in mkt["outcomes"]:
+                    if oc["name"] == "Over":
+                        totals.append(oc["point"])
+                        total_odds_list.append(oc["price"])
+
+    result = {"home": home_abbr}
+    if spreads:
+        result["spread"]     = round(sum(spreads) / len(spreads), 1)
+    if h2hs:
+        result["moneyline"]  = round(sum(h2hs) / len(h2hs))
+    if totals:
+        result["total"]      = round(sum(totals) / len(totals), 1)
+    if total_odds_list:
+        result["total_odds"] = round(sum(total_odds_list) / len(total_odds_list))
+
+    with open(cache_file, "w") as f:
+        json.dump(result, f)
+
+    books_str = ", ".join(bk_names[:3]) + ("..." if len(bk_names) > 3 else "")
+    print(f"  [odds-api] lines fetched ({books_str})")
+    return result
 
 
 def _synthetic_team_stats():
@@ -805,17 +932,35 @@ def main():
     t2   = args.team2.upper()
     home = None if args.neutral else (args.home.upper() if args.home else t1)
 
+    spread     = args.spread
+    moneyline  = args.moneyline
+    total      = args.total
+    total_odds = args.total_odds
+
+    # Auto-fetch live lines when key is set and no manual lines were supplied
+    if (os.environ.get("ODDS_API_KEY") and
+            spread is None and moneyline is None and total is None
+            and not args.neutral):
+        print("Fetching live lines from The Odds API...")
+        live = _fetch_live_odds(t1, t2)
+        if live:
+            if args.home is None and "home" in live:
+                home = live["home"]   # use actual home team from the API
+            spread     = live.get("spread")
+            moneyline  = live.get("moneyline")
+            total      = live.get("total")
+            total_odds = live.get("total_odds")
+
     print("Running prediction...")
     pred = predict(t1, t2, home, ratings)
 
     line_eval = {}
-    if args.spread is not None or args.moneyline is not None or args.total is not None:
-        line_eval = evaluate_line(pred, args.spread, args.moneyline,
-                                  args.total, args.total_odds)
+    if spread is not None or moneyline is not None or total is not None:
+        line_eval = evaluate_line(pred, spread, moneyline, total, total_odds)
 
     print("Generating charts...")
     plot_calibration()
-    plot_spread_distribution(pred, args.spread)
+    plot_spread_distribution(pred, spread)
     plot_team_ats(ratings)
     plot_edge_summary(pred, line_eval)
 
