@@ -28,6 +28,16 @@ import time
 import argparse
 import warnings
 from datetime import datetime, date
+
+# Load shared .env (BALLDONTLIE_API_KEY, ODDS_API_KEY, etc.)
+_env_path = "/root/.openclaw/workspace/538data/.env"
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
 from typing import Optional, List, Dict, Any
 import requests
 from bs4 import BeautifulSoup
@@ -226,7 +236,7 @@ def generate_mock_odds(games: List[Dict[str, str]], ratings: pd.DataFrame) -> Li
 
 def fetch_todays_games(target_date: Optional[str] = None) -> List[Dict[str, str]]:
     """Fetch today's NBA games using BallDontLie (BDL) as priority, fallback to nba_api."""
-    bdl_api_key = os.environ.get("BDL_API_KEY")
+    bdl_api_key = os.environ.get("BALLDONTLIE_API_KEY")
     if bdl_api_key:
         try:
             d = target_date or datetime.now().strftime("%Y-%m-%d")
@@ -242,7 +252,8 @@ def fetch_todays_games(target_date: Optional[str] = None) -> List[Dict[str, str]
 
     try:
         from nba_api.stats.endpoints import scoreboardv2
-        d = (target_date or datetime.now().strftime("%Y-%m-%d")).replace("-", "")
+        raw_d = target_date or datetime.now().strftime("%Y-%m-%d")
+        d = datetime.strptime(raw_d, "%Y-%m-%d").strftime("%m/%d/%Y")
         board = scoreboardv2.ScoreboardV2(game_date=d, timeout=15)
         df = board.get_data_frames()[0]
         return [{"home": r["HOME_TEAM_ABBREVIATION"], "away": r["VISITOR_TEAM_ABBREVIATION"]} for _, r in df.iterrows()]
