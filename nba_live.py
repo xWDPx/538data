@@ -24,6 +24,16 @@ Usage:
 """
 
 import os, sys, json, time, argparse, warnings
+
+# Load shared .env (BALLDONTLIE_API_KEY etc.)
+_env_path = "/root/.openclaw/workspace/538data/.env"
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -41,7 +51,9 @@ OUT   = os.path.join(BASE, "nba_analysis_output")
 CACHE = os.path.join(OUT, "cache")
 os.makedirs(CACHE, exist_ok=True)
 
-SEASON = "2024-25"
+SEASON     = "2024-25"
+BDL_SEASON = 2024
+BDL_BASE   = "https://api.balldontlie.io/nba/v1"
 TITLE_KW = dict(fontsize=13, fontweight="bold", pad=10)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,22 +208,112 @@ def load_player_stats(force_refresh=False):
     print(f"  Player stats: {len(df)} players [{src}]")
     return df, src
 
-def load_game_log(team_abbr, force_refresh=False):
-    from nba_api.stats.static import teams as nba_teams
-    team_list = nba_teams.get_teams()
-    match = [t for t in team_list if t["abbreviation"] == team_abbr]
-    if not match:
-        return _build_synthetic_game_log(team_abbr), "synthetic"
+def _bdl_game_log(team_abbr, force_refresh=False):
+    """
+    Fetch a real 2024-25 game log for team_abbr from BallDontLie.
+    Reuses bdl_games.json written by nba_edge.py if present (<12 h old).
+    Returns (DataFrame, source_str) or (None, reason_str).
+    """
+    import urllib.request
 
-    tid = match[0]["id"]
-    df, src = _try_fetch(
-        "teamgamelog", f"gamelog_{team_abbr}",
-        force_refresh=force_refresh,
-        team_id=tid, season=SEASON,
-    )
-    if df is None:
-        df = _build_synthetic_game_log(team_abbr)
-    return df, src
+    api_key = os.environ.get("BALLDONTLIE_API_KEY", "").strip()
+    if not api_key:
+        return None, "no-bdl-key"
+
+    cache_file = os.path.join(CACHE, "bdl_games.json")
+    games = None
+
+    if not force_refresh and os.path.exists(cache_file):
+        age_h = (time.time() - os.path.getmtime(cache_file)) / 3600
+        if age_h < 12:
+            with open(cache_file) as f:
+                games = json.load(f)
+            source = "bdl-cache"
+
+    if games is None:
+        headers = {"Authorization": api_key, "Accept": "application/json"}
+
+        def _get(url):
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+
+        all_games, cursor = [], None
+        try:
+            for _ in range(80):
+                url = f"{BDL_BASE}/games?seasons[]={BDL_SEASON}&per_page=100"
+                if cursor:
+                    url += f"&cursor={cursor}"
+                resp = _get(url)
+                all_games.extend(resp["data"])
+                cursor = resp.get("meta", {}).get("next_cursor")
+                if not cursor:
+                    break
+                time.sleep(0.4)
+        except Exception as exc:
+            print(f"  [balldontlie] fetch failed ({type(exc).__name__}: {exc})")
+            return None, "bdl-unavailable"
+
+        games = [
+            g for g in all_games
+            if str(g.get("status", "")).lower() == "final"
+            and g.get("home_team_score") and g.get("visitor_team_score")
+        ]
+        with open(cache_file, "w") as f:
+            json.dump(games, f)
+        source = "bdl-live"
+
+    abbr = team_abbr.upper()
+    team_games = [
+        g for g in games
+        if g["home_team"]["abbreviation"] == abbr
+        or g["visitor_team"]["abbreviation"] == abbr
+    ]
+    if not team_games:
+        return None, "bdl-no-games"
+
+    team_games.sort(key=lambda g: g.get("date", ""))
+    rows = []
+    for g in team_games:
+        is_home = g["home_team"]["abbreviation"] == abbr
+        pts     = g["home_team_score"]    if is_home else g["visitor_team_score"]
+        opp_pts = g["visitor_team_score"] if is_home else g["home_team_score"]
+        rows.append({
+            "game_result": "W" if pts > opp_pts else "L",
+            "date_game":   g.get("date", ""),
+            "pts":         pts,
+            "opp_pts":     opp_pts,
+        })
+
+    return pd.DataFrame(rows), source
+
+
+def load_game_log(team_abbr, force_refresh=False):
+    # 1. Try nba_api teamgamelog
+    try:
+        from nba_api.stats.static import teams as nba_teams
+        team_list = nba_teams.get_teams()
+        match = [t for t in team_list if t["abbreviation"] == team_abbr]
+        if match:
+            tid = match[0]["id"]
+            df, src = _try_fetch(
+                "teamgamelog", f"gamelog_{team_abbr}",
+                force_refresh=force_refresh,
+                team_id=tid, season=SEASON,
+            )
+            if df is not None:
+                return df, src
+    except Exception:
+        pass
+
+    # 2. BDL real schedule (actual 2024-25 results)
+    bdl_df, bdl_src = _bdl_game_log(team_abbr, force_refresh)
+    if bdl_df is not None:
+        print(f"  [{team_abbr}] {len(bdl_df)} games [{bdl_src}]")
+        return bdl_df, bdl_src
+
+    # 3. Synthetic fallback
+    return _build_synthetic_game_log(team_abbr), "synthetic"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 4 — Matchup predictor
