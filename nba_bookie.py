@@ -267,23 +267,41 @@ def fetch_todays_games(target_date: Optional[str] = None) -> List[Dict[str, str]
 def analyze_game(home, away, home_spread, home_ml, away_ml, ratings) -> Dict[str, Any]:
     pred_home = predict(home, away, home, ratings)
     pred_away = predict(away, home, home, ratings)
-    
+
     res = {"game": f"{away} @ {home}", "home_team": home, "away_team": away, "home": {}, "away": {}}
-    
+
     if home_ml:
         eval_h = evaluate_line(pred_home, home_spread, float(home_ml))
         res["home"] = {
-            "moneyline": home_ml, "spread": home_spread, "fair_ml": pred_home["fair_american"], 
+            "moneyline": home_ml, "spread": home_spread, "fair_ml": pred_home["fair_american"],
             "edge_pct": eval_h.get("edge_pct", 0), "ev_per_100": eval_h.get("ev_per_100", 0),
             "verdict": eval_h.get("verdict", "PASS"), "win_prob": pred_home["win_prob_ats"]
         }
     if away_ml:
         eval_a = evaluate_line(pred_away, -home_spread if home_spread else None, float(away_ml))
         res["away"] = {
-            "moneyline": away_ml, "spread": -home_spread if home_spread else None, "fair_ml": pred_away["fair_american"], 
+            "moneyline": away_ml, "spread": -home_spread if home_spread else None, "fair_ml": pred_away["fair_american"],
             "edge_pct": eval_a.get("edge_pct", 0), "ev_per_100": eval_a.get("ev_per_100", 0),
             "verdict": eval_a.get("verdict", "PASS"), "win_prob": pred_away["win_prob_ats"]
         }
+
+    # Spread bet evaluation — assumes standard -110 juice when no spread odds scraped
+    if home_spread is not None:
+        eval_h_spd = evaluate_line(pred_home, home_spread, -110)
+        res["home"].update({
+            "spread_cover_prob": eval_h_spd.get("cover_prob"),
+            "spread_edge_pct": eval_h_spd.get("edge_pct", 0),
+            "spread_ev_per_100": eval_h_spd.get("ev_per_100", 0),
+            "spread_verdict": eval_h_spd.get("verdict", "PASS"),
+        })
+        eval_a_spd = evaluate_line(pred_away, -home_spread, -110)
+        res["away"].update({
+            "spread_cover_prob": eval_a_spd.get("cover_prob"),
+            "spread_edge_pct": eval_a_spd.get("edge_pct", 0),
+            "spread_ev_per_100": eval_a_spd.get("ev_per_100", 0),
+            "spread_verdict": eval_a_spd.get("verdict", "PASS"),
+        })
+
     return res
 
 
@@ -299,13 +317,13 @@ def print_report_console(report: Dict[str, Any]):
         items = report.get(category, [])
         if items:
             print(f"\n  {label}:")
-            print(f"  {'Team':<8} {'Game':<25} {'Line':<10} {'Fair':<10} {'Edge':<8} {'EV/$100':<10}")
+            print(f"  {'Team':<8} {'Type':<6} {'Game':<22} {'Line':<10} {'Fair':<10} {'Edge':<8} {'EV/$100':<10}")
             print(f"  {'-'*74}")
             for b in items[:5]:
                 line = f"{b['line']:+.1f}" if b['type'] == 'spread' else f"{b['line']:.0f}"
                 fair = f"{b.get('fair_ml', 'n/a')}"
                 ev = f"${b.get('ev_per_100', 0):>+.2f}"
-                print(f"  {b['team']:<8} {b['game']:<25} {line:<10} {fair:<10} {b['edge_pct']:>+.1%}  {ev}")
+                print(f"  {b['team']:<8} {b['type']:<6} {b['game']:<22} {line:<10} {fair:<10} {b['edge_pct']:>+.1%}  {ev}")
 
     if not any(report.get(k) for k in ["strong_edges", "edges", "marginals"]):
         print(f"\n  No significant edges found today based on model confidence.")
@@ -343,12 +361,27 @@ def main():
     for g in results:
         for side in ["home", "away"]:
             d = g[side]
-            if not d: continue
-            all_bets.append({
-                "game": g["game"], "team": g[f"{side}_team"], "type": "moneyline",
-                "line": d["moneyline"], "fair_ml": d["fair_ml"], "edge_pct": d["edge_pct"],
-                "ev_per_100": d["ev_per_100"], "verdict": d["verdict"]
-            })
+            if not d:
+                continue
+            # Moneyline bet
+            if d.get("moneyline"):
+                all_bets.append({
+                    "game": g["game"], "team": g[f"{side}_team"], "type": "moneyline",
+                    "line": d["moneyline"], "fair_ml": d["fair_ml"],
+                    "edge_pct": d["edge_pct"], "ev_per_100": d["ev_per_100"],
+                    "verdict": d["verdict"],
+                })
+            # Spread bet
+            if d.get("spread") is not None and d.get("spread_verdict"):
+                cover = d.get("spread_cover_prob")
+                all_bets.append({
+                    "game": g["game"], "team": g[f"{side}_team"], "type": "spread",
+                    "line": d["spread"],
+                    "fair_ml": f"{cover:.1%}" if cover is not None else "n/a",
+                    "edge_pct": d.get("spread_edge_pct", 0),
+                    "ev_per_100": d.get("spread_ev_per_100", 0),
+                    "verdict": d.get("spread_verdict", "PASS"),
+                })
     
     all_bets.sort(key=lambda x: x["ev_per_100"], reverse=True)
     report = {
